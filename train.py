@@ -5,6 +5,7 @@ import json
 import torch
 import torch.nn as nn
 from torchvision import transforms, datasets
+from torchvision.datasets.folder import IMG_EXTENSIONS
 import torch.optim as optim
 from tqdm import tqdm
 
@@ -14,10 +15,83 @@ from model.DSAmamba import VSSM as dsamamba  # import model
 import rl_plotter
 from rl_plotter import logger
 import argparse
+import pandas as pd
+from PIL import Image
 import medmnist
 from medmnist import INFO, Evaluator
 from sklearn.metrics import roc_auc_score, precision_score, recall_score, f1_score, confusion_matrix
 import numpy as np
+
+
+class HbImageDataset(torch.utils.data.Dataset):
+    """Custom dataset that maps image files to HB values (from Excel/CSV) and produces binary labels.
+
+    Expects a DataFrame or path with at least filename and hb columns. Labels: 1=anemic (hb < threshold), 0=non-anemic.
+    """
+    def __init__(self, images_dir, mapping_df, image_col='image_name', hb_col='hb', transform=None, hb_threshold=12.0):
+        self.images_dir = images_dir
+        if isinstance(mapping_df, str):
+            # try csv first, then excel
+            if mapping_df.lower().endswith('.csv'):
+                df = pd.read_csv(mapping_df)
+            else:
+                try:
+                    df = pd.read_excel(mapping_df)
+                except Exception:
+                    df = pd.read_csv(mapping_df)
+            self.df = df
+        else:
+            self.df = mapping_df.copy()
+
+        self.image_col = image_col
+        self.hb_col = hb_col
+        self.transform = transform
+        self.hb_threshold = float(hb_threshold)
+
+        # build samples list (full paths and labels)
+        self.samples = []
+        for _, row in self.df.iterrows():
+            img_name = str(row[self.image_col])
+            img_base = os.path.basename(img_name)
+            # try to find matching file in folder; allow any supported extension
+            found = None
+            for ext in IMG_EXTENSIONS:
+                candidate = os.path.join(self.images_dir, img_base if img_base.lower().endswith(ext) else img_base + ext)
+                if os.path.exists(candidate):
+                    found = candidate
+                    break
+            # also check if img_name already includes relative path inside images_dir
+            if found is None:
+                candidate2 = os.path.join(self.images_dir, img_name)
+                if os.path.exists(candidate2):
+                    found = candidate2
+
+            if found is None:
+                # try direct path
+                if os.path.exists(img_name):
+                    found = img_name
+
+            if found is None:
+                continue
+
+            try:
+                hb_val = float(row[self.hb_col])
+            except Exception:
+                continue
+
+            label = 1 if hb_val < self.hb_threshold else 0
+            self.samples.append((found, label))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        img = Image.open(path).convert('RGB')
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, label
+
 
 
 def get_args_parser():
@@ -32,6 +106,14 @@ def get_args_parser():
     parser.add_argument('--train-dataset-path', default='kvasir-dataset-v2/train',
                         type=str)
     parser.add_argument('--val-dataset-path', default='kvasir-dataset-v2/val', type=str)
+    parser.add_argument('--csv-path', default=None, type=str,
+                        help='Path to CSV/Excel mapping file with image filenames and HB values')
+    parser.add_argument('--image-col', default='image_name', type=str,
+                        help='Column name in mapping file containing image filenames')
+    parser.add_argument('--hb-col', default='hb', type=str,
+                        help='Column name in mapping file containing HB values')
+    parser.add_argument('--hb-threshold', default=12.0, type=float,
+                        help='HB threshold to decide anemia (hb < threshold => anemic)')
     parser.add_argument('--val-split', default=0.2, type=float,
                         help='If `val-dataset-path` does not exist, split `train-dataset-path` by this fraction for validation')
     parser.add_argument('--medmnist', default=False, type=bool)
@@ -68,6 +150,67 @@ def main():
         # If a separate validation folder exists use it, otherwise split the provided dataset root dynamically
         train_root = args.train_dataset_path
         val_root = args.val_dataset_path
+
+        # If a mapping CSV/Excel is provided, build datasets from it (binary anemia labels)
+        if args.csv_path is not None:
+            print(f"Loading mapping from {args.csv_path}")
+            # read mapping
+            if args.csv_path.lower().endswith('.csv'):
+                mapping_df = pd.read_csv(args.csv_path)
+            else:
+                try:
+                    mapping_df = pd.read_excel(args.csv_path)
+                except Exception:
+                    mapping_df = pd.read_csv(args.csv_path)
+
+            # If val_root exists and points to a folder, use it for validation mapping if a separate file exists
+            # Otherwise split mapping into train/val
+            if os.path.isdir(val_root):
+                train_dataset = HbImageDataset(train_root, mapping_df, image_col=args.image_col,
+                                               hb_col=args.hb_col, transform=data_transform['train'],
+                                               hb_threshold=args.hb_threshold)
+                validate_dataset = datasets.ImageFolder(root=val_root, transform=data_transform['val'])
+            else:
+                # split mapping rows
+                total_rows = len(mapping_df)
+                if total_rows == 0:
+                    raise RuntimeError(f"No entries found in mapping {args.csv_path}")
+                val_frac = float(args.val_split)
+                if not (0.0 <= val_frac < 1.0):
+                    raise ValueError("--val-split must be in [0.0, 1.0)")
+                val_len = int(total_rows * val_frac)
+                train_len = total_rows - val_len
+                if val_len == 0:
+                    val_len = max(1, total_rows // 10)
+                    train_len = total_rows - val_len
+
+                train_df = mapping_df.iloc[:train_len].reset_index(drop=True)
+                val_df = mapping_df.iloc[train_len:train_len+val_len].reset_index(drop=True)
+
+                train_dataset = HbImageDataset(train_root, train_df, image_col=args.image_col,
+                                               hb_col=args.hb_col, transform=data_transform['train'],
+                                               hb_threshold=args.hb_threshold)
+                validate_dataset = HbImageDataset(train_root, val_df, image_col=args.image_col,
+                                                  hb_col=args.hb_col, transform=data_transform['val'],
+                                                  hb_threshold=args.hb_threshold)
+
+            # set num_classes for binary task
+            args.num_classes = 2
+            # create class mapping
+            cla_dict = {0: 'non_anemic', 1: 'anemic'}
+            with open('class_indices.json', 'w') as json_file:
+                json.dump(cla_dict, json_file, indent=4)
+
+            train_num = len(train_dataset)
+            val_num = len(validate_dataset)
+
+            train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                                                       num_workers=args.num_works)
+            validate_loader = torch.utils.data.DataLoader(validate_dataset, batch_size=args.batch_size, shuffle=False,
+                                                          num_workers=args.num_works)
+            print(f"using {train_num} images for training, {val_num} images for validation (from mapping).")
+            # Skip the rest of folder-based handling
+        else:
 
         if os.path.isdir(val_root):
             train_dataset = datasets.ImageFolder(root=train_root, transform=data_transform["train"])
