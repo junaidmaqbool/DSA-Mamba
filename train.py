@@ -32,6 +32,8 @@ def get_args_parser():
     parser.add_argument('--train-dataset-path', default='kvasir-dataset-v2/train',
                         type=str)
     parser.add_argument('--val-dataset-path', default='kvasir-dataset-v2/val', type=str)
+    parser.add_argument('--val-split', default=0.2, type=float,
+                        help='If `val-dataset-path` does not exist, split `train-dataset-path` by this fraction for validation')
     parser.add_argument('--medmnist', default=False, type=bool)
     parser.add_argument('--medmnist-download', default=False, type=bool)
     parser.add_argument('--medmnist-choice', default='octmnist', type=str,
@@ -63,29 +65,61 @@ def main():
             "val": transforms.Compose([transforms.Resize((224, 224)),
                                        transforms.ToTensor(),
                                        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])}
-        # TODO
-        train_dataset = datasets.ImageFolder(root=args.train_dataset_path,
-                                             transform=data_transform["train"])
-        train_num = len(train_dataset)
+        # If a separate validation folder exists use it, otherwise split the provided dataset root dynamically
+        train_root = args.train_dataset_path
+        val_root = args.val_dataset_path
 
-        flower_list = train_dataset.class_to_idx
-        cla_dict = dict((val, key) for key, val in flower_list.items())
-        # write dict into json file
-        json_str = json.dumps(cla_dict, indent=4)
-        with open('class_indices.json', 'w') as json_file:
-            json_file.write(json_str)
+        if os.path.isdir(val_root):
+            train_dataset = datasets.ImageFolder(root=train_root, transform=data_transform["train"])
+            validate_dataset = datasets.ImageFolder(root=val_root, transform=data_transform["val"])
 
-        train_loader = torch.utils.data.DataLoader(train_dataset,
-                                                   batch_size=args.batch_size, shuffle=True,
-                                                   num_workers=args.num_works)
+            train_num = len(train_dataset)
+            val_num = len(validate_dataset)
 
-        validate_dataset = datasets.ImageFolder(root=args.val_dataset_path,
-                                                transform=data_transform["val"])
-        val_num = len(validate_dataset)
-        validate_loader = torch.utils.data.DataLoader(validate_dataset,
-                                                      batch_size=args.batch_size, shuffle=False,
-                                                      num_workers=args.num_works)
-        print("using {} images for training, {} images for validation.".format(train_num, val_num))
+            flower_list = train_dataset.class_to_idx
+            cla_dict = dict((val, key) for key, val in flower_list.items())
+            json_str = json.dumps(cla_dict, indent=4)
+            with open('class_indices.json', 'w') as json_file:
+                json_file.write(json_str)
+
+            train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                                                       num_workers=args.num_works)
+            validate_loader = torch.utils.data.DataLoader(validate_dataset, batch_size=args.batch_size, shuffle=False,
+                                                          num_workers=args.num_works)
+            print("using {} images for training, {} images for validation.".format(train_num, val_num))
+        else:
+            # Single root provided: use ImageFolder and split into train/val
+            full_dataset = datasets.ImageFolder(root=train_root, transform=data_transform["train"])
+            total = len(full_dataset)
+            if total == 0:
+                raise RuntimeError(f"No images found in {train_root}")
+
+            val_frac = float(args.val_split)
+            if not (0.0 <= val_frac < 1.0):
+                raise ValueError("--val-split must be in [0.0, 1.0)")
+
+            val_len = int(total * val_frac)
+            train_len = total - val_len
+            if val_len == 0:
+                val_len = max(1, total // 10)
+                train_len = total - val_len
+
+            train_dataset, validate_dataset = torch.utils.data.random_split(full_dataset, [train_len, val_len])
+
+            # save class mapping using the underlying dataset
+            flower_list = full_dataset.class_to_idx
+            cla_dict = dict((val, key) for key, val in flower_list.items())
+            with open('class_indices.json', 'w') as json_file:
+                json.dump(cla_dict, json_file, indent=4)
+
+            train_num = train_len
+            val_num = val_len
+
+            train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                                                       num_workers=args.num_works)
+            validate_loader = torch.utils.data.DataLoader(validate_dataset, batch_size=args.batch_size, shuffle=False,
+                                                          num_workers=args.num_works)
+            print(f"Dynamically split {total} images -> {train_num} train, {val_num} val (val_split={val_frac})")
     else:
         print('use medmnist datasets')
         info = INFO[args.medmnist_choice]
