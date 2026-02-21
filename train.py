@@ -18,9 +18,16 @@ import argparse
 import pandas as pd
 from PIL import Image
 import medmnist
-from medmnist import INFO, Evaluator
 from sklearn.metrics import roc_auc_score, precision_score, recall_score, f1_score, confusion_matrix
 import numpy as np
+
+# Import medmnist INFO and Evaluator conditionally 
+# (only needed if using medmnist datasets via --medmnist flag)
+try:
+    from medmnist import INFO, Evaluator
+except ImportError:
+    INFO = {}
+    Evaluator = None
 
 
 class HbImageDataset(torch.utils.data.Dataset):
@@ -265,6 +272,8 @@ def main():
                 print(f"Dynamically split {total} images -> {train_num} train, {val_num} val (val_split={val_frac})")
     else:
         print('use medmnist datasets')
+        if not INFO:
+            raise ImportError("medmnist is not properly installed. Please install it with: pip install medmnist")
         info = INFO[args.medmnist_choice]
         # task = info['task']
         args.n_channels = info['n_channels']
