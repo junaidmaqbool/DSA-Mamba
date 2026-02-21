@@ -6,43 +6,49 @@ import torch.nn.functional as F
 class CrossAttention(nn.Module):
     """
     Cross-Attention module that computes attention between query and key-value pairs.
-    Handles both 3D (B, N, C) and 4D (B, H, W, C) tensor inputs.
-    Robustly handles mismatched input/output dimensions.
+    Handles both 3D (B, N, C) and 4D (B, H, W, C) tensor inputs with variable dimensions.
+    Fully adaptive - handles any input/output dimension combinations.
     
     Args:
-        dim: Dimension of the query input
-        key_dim: Dimension of the key
-        value_dim: Dimension of the value
+        dim: Target dimension for output
+        key_dim: Internal key dimension (default: dim)
+        value_dim: Internal value dimension (default: dim) 
         num_heads: Number of attention heads (default: 8)
         attn_drop: Attention dropout rate (default: 0.)
         proj_drop: Projection dropout rate (default: 0.)
     """
     
-    def __init__(self, dim, key_dim, value_dim, num_heads=8, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, key_dim=None, value_dim=None, num_heads=8, attn_drop=0., proj_drop=0.):
         super().__init__()
         self.num_heads = num_heads
         self.dim = dim
-        self.key_dim = key_dim
-        self.value_dim = value_dim
-        self.scale = (key_dim // num_heads) ** -0.5
+        self.key_dim = key_dim if key_dim is not None else dim
+        self.value_dim = value_dim if value_dim is not None else dim
         
-        # Linear projections for query, key, value
-        self.q_proj = nn.Linear(dim, key_dim, bias=True)
-        # Add a kv input projection to handle variable input dimensions
-        self.kv_in_proj = nn.Linear(dim, key_dim + value_dim, bias=True)
+        # Ensure dimensions are compatible with num_heads
+        assert self.key_dim % num_heads == 0, f"key_dim ({self.key_dim}) must be divisible by num_heads ({num_heads})"
+        assert self.value_dim % num_heads == 0, f"value_dim ({self.value_dim}) must be divisible by num_heads ({num_heads})"
+        
+        self.head_dim_k = self.key_dim // num_heads
+        self.head_dim_v = self.value_dim // num_heads
+        self.scale = self.head_dim_k ** -0.5
+        
+        # Use LazyLinear to automatically infer input dimensions
+        self.q_proj = nn.LazyLinear(self.key_dim)
+        self.kv_in_proj = nn.LazyLinear(self.key_dim + self.value_dim)
+        self.out_proj = nn.Linear(self.value_dim, self.dim, bias=True)
         
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(value_dim, dim, bias=True)
         self.proj_drop = nn.Dropout(proj_drop)
     
     def forward(self, q, kv):
         """
         Args:
             q: Query input tensor of shape (B, N, C) or (B, H, W, C)
-            kv: Key-value input tensor of shape (B, N, C) or (B, H, W, C), may have different C
+            kv: Key-value input tensor of shape (B, N, C) or (B, H, W, C), can have different C
         
         Returns:
-            Output tensor with same shape as q
+            Output tensor of shape matching q
         """
         # Handle 4D (B, H, W, C) tensors by flattening spatial dimensions
         is_4d = q.dim() == 4
@@ -53,27 +59,29 @@ class CrossAttention(nn.Module):
             q = q.reshape(B, H*W, C)
             kv = kv.reshape(kv.shape[0], -1, kv.shape[-1])
         
-        B, N, C_q = q.shape
+        B, N_q, C_q = q.shape
         B_kv, N_kv, C_kv = kv.shape
         
         # Project query
-        q = self.q_proj(q).reshape(B, N, self.num_heads, self.key_dim // self.num_heads).permute(0, 2, 1, 3)
+        q_proj = self.q_proj(q)  # (B, N_q, key_dim)
+        q_proj = q_proj.reshape(B, N_q, self.num_heads, self.head_dim_k).permute(0, 2, 1, 3)  # (B, num_heads, N_q, head_dim_k)
         
-        # Project kv - use the dedicated kv_in_proj that can handle variable input dims
+        # Project kv
         kv_proj = self.kv_in_proj(kv)  # (B, N_kv, key_dim + value_dim)
-        k, v = kv_proj.chunk(2, dim=-1)  # Split into k and v
+        k_proj, v_proj = kv_proj.chunk(2, dim=-1)  # Split into k and v
         
-        k = k.reshape(B_kv, N_kv, self.num_heads, self.key_dim // self.num_heads).permute(0, 2, 1, 3)
-        v = v.reshape(B_kv, N_kv, self.num_heads, self.value_dim // self.num_heads).permute(0, 2, 1, 3)
+        k_proj = k_proj.reshape(B_kv, N_kv, self.num_heads, self.head_dim_k).permute(0, 2, 1, 3)  # (B, num_heads, N_kv, head_dim_k)
+        v_proj = v_proj.reshape(B_kv, N_kv, self.num_heads, self.head_dim_v).permute(0, 2, 1, 3)  # (B, num_heads, N_kv, head_dim_v)
         
         # Compute attention scores
-        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = (q_proj @ k_proj.transpose(-2, -1)) * self.scale  # (B, num_heads, N_q, N_kv)
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
         
         # Apply attention to values
-        x = (attn @ v).transpose(1, 2).reshape(B, N, self.value_dim)
-        x = self.proj(x)
+        x = attn @ v_proj  # (B, num_heads, N_q, head_dim_v)
+        x = x.transpose(1, 2).reshape(B, N_q, self.value_dim)  # (B, N_q, value_dim)
+        x = self.out_proj(x)  # (B, N_q, dim)
         x = self.proj_drop(x)
         
         # Reshape back to 4D if input was 4D
@@ -81,5 +89,7 @@ class CrossAttention(nn.Module):
             x = x.reshape(*original_shape, -1)
         
         return x
+
+
 
 
