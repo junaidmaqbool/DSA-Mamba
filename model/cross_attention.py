@@ -43,12 +43,12 @@ class CrossAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj_drop = nn.Dropout(proj_drop)
     
-    def _ensure_projections_initialized(self, q_dim, kv_dim):
-        """Initialize projection layers on first forward pass."""
+    def _ensure_projections_initialized(self, q_dim, kv_dim, device):
+        """Initialize projection layers on first forward pass with correct device."""
         if self._q_proj is None or self._last_q_dim != q_dim or self._last_kv_dim != kv_dim:
-            self._q_proj = nn.Linear(q_dim, self.key_dim, bias=True).to(self._get_device())
-            self._kv_in_proj = nn.Linear(kv_dim, self.key_dim + self.value_dim, bias=True).to(self._get_device())
-            self._out_proj = nn.Linear(self.value_dim, self.dim, bias=True).to(self._get_device())
+            self._q_proj = nn.Linear(q_dim, self.key_dim, bias=True).to(device)
+            self._kv_in_proj = nn.Linear(kv_dim, self.key_dim + self.value_dim, bias=True).to(device)
+            self._out_proj = nn.Linear(self.value_dim, self.dim, bias=True).to(device)
             self._last_q_dim = q_dim
             self._last_kv_dim = kv_dim
     
@@ -80,8 +80,11 @@ class CrossAttention(nn.Module):
         B, N_q, C_q = q.shape
         B_kv, N_kv, C_kv = kv.shape
         
-        # Initialize projections on first use
-        self._ensure_projections_initialized(C_q, C_kv)
+        # Get device from input tensor
+        device = q.device
+        
+        # Initialize projections on first use with correct device
+        self._ensure_projections_initialized(C_q, C_kv, device)
         
         # Project query
         q_proj = self._q_proj(q)  # (B, N_q, key_dim)
