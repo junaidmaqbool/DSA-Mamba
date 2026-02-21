@@ -7,10 +7,9 @@ class CrossAttention(nn.Module):
     """
     Cross-Attention module that computes attention between query and key-value pairs.
     Handles both 3D (B, N, C) and 4D (B, H, W, C) tensor inputs with variable dimensions.
-    Fully adaptive - handles any input/output dimension combinations.
     
     Args:
-        dim: Target dimension for output
+        dim: Output dimension (also used for query if key_dim/value_dim not specified)
         key_dim: Internal key dimension (default: dim)
         value_dim: Internal value dimension (default: dim) 
         num_heads: Number of attention heads (default: 8)
@@ -33,13 +32,32 @@ class CrossAttention(nn.Module):
         self.head_dim_v = self.value_dim // num_heads
         self.scale = self.head_dim_k ** -0.5
         
-        # Use LazyLinear to automatically infer input dimensions
-        self.q_proj = nn.LazyLinear(self.key_dim)
-        self.kv_in_proj = nn.LazyLinear(self.key_dim + self.value_dim)
-        self.out_proj = nn.Linear(self.value_dim, self.dim, bias=True)
+        # We'll initialize projections lazily on first use
+        # Store the layer definitions but not the actual layers yet
+        self._q_proj = None
+        self._kv_in_proj = None
+        self._out_proj = None
+        self._last_q_dim = None
+        self._last_kv_dim = None
         
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj_drop = nn.Dropout(proj_drop)
+    
+    def _ensure_projections_initialized(self, q_dim, kv_dim):
+        """Initialize projection layers on first forward pass."""
+        if self._q_proj is None or self._last_q_dim != q_dim or self._last_kv_dim != kv_dim:
+            self._q_proj = nn.Linear(q_dim, self.key_dim, bias=True).to(self._get_device())
+            self._kv_in_proj = nn.Linear(kv_dim, self.key_dim + self.value_dim, bias=True).to(self._get_device())
+            self._out_proj = nn.Linear(self.value_dim, self.dim, bias=True).to(self._get_device())
+            self._last_q_dim = q_dim
+            self._last_kv_dim = kv_dim
+    
+    def _get_device(self):
+        """Get device - fallback to CPU if no parameters registered yet."""
+        try:
+            return next(self.parameters()).device
+        except StopIteration:
+            return torch.device('cpu')
     
     def forward(self, q, kv):
         """
@@ -62,12 +80,15 @@ class CrossAttention(nn.Module):
         B, N_q, C_q = q.shape
         B_kv, N_kv, C_kv = kv.shape
         
+        # Initialize projections on first use
+        self._ensure_projections_initialized(C_q, C_kv)
+        
         # Project query
-        q_proj = self.q_proj(q)  # (B, N_q, key_dim)
+        q_proj = self._q_proj(q)  # (B, N_q, key_dim)
         q_proj = q_proj.reshape(B, N_q, self.num_heads, self.head_dim_k).permute(0, 2, 1, 3)  # (B, num_heads, N_q, head_dim_k)
         
         # Project kv
-        kv_proj = self.kv_in_proj(kv)  # (B, N_kv, key_dim + value_dim)
+        kv_proj = self._kv_in_proj(kv)  # (B, N_kv, key_dim + value_dim)
         k_proj, v_proj = kv_proj.chunk(2, dim=-1)  # Split into k and v
         
         k_proj = k_proj.reshape(B_kv, N_kv, self.num_heads, self.head_dim_k).permute(0, 2, 1, 3)  # (B, num_heads, N_kv, head_dim_k)
@@ -81,7 +102,7 @@ class CrossAttention(nn.Module):
         # Apply attention to values
         x = attn @ v_proj  # (B, num_heads, N_q, head_dim_v)
         x = x.transpose(1, 2).reshape(B, N_q, self.value_dim)  # (B, N_q, value_dim)
-        x = self.out_proj(x)  # (B, N_q, dim)
+        x = self._out_proj(x)  # (B, N_q, dim)
         x = self.proj_drop(x)
         
         # Reshape back to 4D if input was 4D
@@ -89,6 +110,7 @@ class CrossAttention(nn.Module):
             x = x.reshape(*original_shape, -1)
         
         return x
+
 
 
 

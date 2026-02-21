@@ -700,9 +700,11 @@ class VSSM(nn.Module):
         Conv2D is not intialized !!!
         """
         if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
+            # Skip uninitialized parameters from lazy layers
+            if m.weight.data is not None and m.weight.data.numel() > 0:
+                trunc_normal_(m.weight, std=.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
