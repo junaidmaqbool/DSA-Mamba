@@ -25,7 +25,6 @@ except ImportError:
     def selective_scan_fn(u, delta, A, B, C, D, z=None, delta_softplus=True, return_last_state=False):
         """
         Fallback selective scan implementation for when mamba_ssm is not available.
-        This is a simplified Python implementation.
         
         Args:
             u: input (B, D, L)
@@ -38,42 +37,53 @@ except ImportError:
             delta_softplus: whether to apply softplus to delta
             return_last_state: whether to return last hidden state
         """
-        batch, dim, seq_len = u.shape
+        batch, d_model, seq_len = u.shape
+        n_state = A.shape[1]
         
         if delta_softplus:
             delta = torch.nn.functional.softplus(delta)
         
-        # Ensure proper shapes
-        if B.dim() == 3:  # (B, N, L)
-            B = B.unsqueeze(1)  # (B, 1, N, L)
-        if C.dim() == 3:  # (B, N, L)
-            C = C.unsqueeze(1)  # (B, 1, N, L)
+        # Reshape B and C if needed
+        if B.dim() == 3:  # (B, N, L) -> (B, 1, N, L)
+            B = B.unsqueeze(1)
+        if C.dim() == 3:  # (B, N, L) -> (B, 1, N, L)
+            C = C.unsqueeze(1)
         
-        # Simple selective scan: iterative computation
-        # h[n] = A * h[n-1] + B[n] * u[n]
-        # y[n] = C[n] * h[n] + D * u[n]
+        # A: (D, N) -> reshape for broadcasting
+        # Compute: exp(delta * A) where delta is (B, D, 1)
+        # Result should be (B, D, N)
         
-        A = A.view(-1)  # (D * N,) -> (D,)
-        D = D.view(-1)  # (D,)
+        D = D.view(-1)  # ensure 1D
         
         output = []
-        h = torch.zeros(batch, dim, A.shape[0] // dim, dtype=u.dtype, device=u.device)
+        h = torch.zeros(batch, d_model, n_state, dtype=u.dtype, device=u.device)
         
         for i in range(seq_len):
             u_i = u[:, :, i]  # (B, D)
-            delta_i = delta[:, :, i:i+1]  # (B, D, 1)
+            delta_i = delta[:, :, i]  # (B, D)
             B_i = B[:, :, :, i]  # (B, 1, N)
             C_i = C[:, :, :, i]  # (B, 1, N)
             
-            # Compute new hidden state: h = exp(delta * A) * h + delta * B * u
-            exp_delta_A = torch.exp(delta_i * A.view(1, -1, 1))  # (B, D, N)
-            h = h * exp_delta_A.squeeze(-1).view(batch, dim, -1)
+            # Compute: h = exp(delta * A) * h + (delta * B) * u
+            # delta_i: (B, D) -> (B, D, 1)
+            # A: (D, N)
+            # exp(delta * A): (B, D, N)
+            delta_A = delta_i.unsqueeze(-1) * A.unsqueeze(0)  # (B, D, N)
+            exp_delta_A = torch.exp(delta_A)  # (B, D, N)
             
-            # Simple update: h = h + B_i * u_i (simplified, actual impl is more complex)
-            h = h + (B_i * u_i.unsqueeze(2)).squeeze(1)  # Update hidden state
+            h = h * exp_delta_A  # (B, D, N)
             
-            # Compute output: y = C * h + D * u
-            y_i = (C_i * h.unsqueeze(1)).sum(dim=-1) + (D * u_i).unsqueeze(1)  # (B, D)
+            # Add input contribution: (delta * B) * u
+            # delta_i: (B, D, 1), B_i: (B, 1, N), u_i: (B, D, 1)
+            delta_B_u = (delta_i.unsqueeze(-1) * B_i) @ u_i.unsqueeze(-1)  # (B, D, N, 1) -> (B, D, N, 1)
+            delta_B_u = delta_B_u.squeeze(-1)  # (B, D, N)
+            h = h + delta_B_u
+            
+            # Compute output: y = h * C + D * u
+            # h: (B, D, N), C_i: (B, 1, N) -> (B, D)
+            y_i = (h * C_i.transpose(1, 2)).sum(dim=-1)  # (B, D)
+            y_i = y_i + D * u_i  # (B, D)
+            
             output.append(y_i)
         
         output = torch.stack(output, dim=-1)  # (B, D, L)

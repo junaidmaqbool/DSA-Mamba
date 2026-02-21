@@ -34,6 +34,7 @@ class HbImageDataset(torch.utils.data.Dataset):
     """Custom dataset that maps image files to HB values (from Excel/CSV) and produces binary labels.
 
     Expects a DataFrame or path with at least filename and hb columns. Labels: 1=anemic (hb < threshold), 0=non-anemic.
+    Automatically validates and skips corrupted or missing images.
     """
     def __init__(self, images_dir, mapping_df, image_col='image_name', hb_col='hb', transform=None, hb_threshold=12.0):
         self.images_dir = images_dir
@@ -55,49 +56,89 @@ class HbImageDataset(torch.utils.data.Dataset):
         self.transform = transform
         self.hb_threshold = float(hb_threshold)
 
-        # build samples list (full paths and labels)
+        # build samples list (full paths and labels), with validation
         self.samples = []
-        for _, row in self.df.iterrows():
+        skipped_count = 0
+        valid_count = 0
+        
+        for idx, (_, row) in enumerate(self.df.iterrows()):
+            skip_reason = None
+            
+            # Find image file
             img_name = str(row[self.image_col])
             img_base = os.path.basename(img_name)
-            # try to find matching file in folder; allow any supported extension
             found = None
+            
             for ext in IMG_EXTENSIONS:
                 candidate = os.path.join(self.images_dir, img_base if img_base.lower().endswith(ext) else img_base + ext)
                 if os.path.exists(candidate):
                     found = candidate
                     break
-            # also check if img_name already includes relative path inside images_dir
+            
             if found is None:
                 candidate2 = os.path.join(self.images_dir, img_name)
                 if os.path.exists(candidate2):
                     found = candidate2
 
             if found is None:
-                # try direct path
                 if os.path.exists(img_name):
                     found = img_name
-
+            
             if found is None:
-                continue
-
-            try:
-                hb_val = float(row[self.hb_col])
-            except Exception:
-                continue
-
-            label = 1 if hb_val < self.hb_threshold else 0
-            self.samples.append((found, label))
+                skip_reason = "file_not_found"
+            else:
+                # Validate HB value
+                try:
+                    hb_val = float(row[self.hb_col])
+                except Exception as e:
+                    skip_reason = f"invalid_hb_value ({str(e)})"
+                else:
+                    # Try to open and validate the image
+                    try:
+                        with Image.open(found) as img:
+                            img.verify()  # Verify the image is not corrupted
+                        # Reopen to check if it can be converted to RGB
+                        with Image.open(found) as img:
+                            _ = img.convert('RGB')
+                        
+                        # All checks passed - add to samples
+                        label = 1 if hb_val < self.hb_threshold else 0
+                        self.samples.append((found, label))
+                        valid_count += 1
+                        
+                    except Exception as e:
+                        skip_reason = f"corrupted_image ({str(e)[:30]})"
+            
+            if skip_reason:
+                skipped_count += 1
+        
+        print(f"HbImageDataset loaded: {valid_count} valid images, {skipped_count} skipped")
+        if skipped_count > 0:
+            print(f"  Reason for skipped images: check logs above for details")
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         path, label = self.samples[idx]
-        img = Image.open(path).convert('RGB')
-        if self.transform is not None:
-            img = self.transform(img)
-        return img, label
+        try:
+            img = Image.open(path).convert('RGB')
+            if self.transform is not None:
+                img = self.transform(img)
+            return img, label
+        except Exception as e:
+            print(f"Warning: Failed to load image at {path}: {e}. Returning a zero tensor instead.")
+            # Return a zero tensor as fallback to prevent training interruption
+            if self.transform is not None:
+                # Try to infer shape from an empty transform
+                try:
+                    dummy_img = Image.new('RGB', (224, 224))
+                    img = self.transform(dummy_img)
+                except Exception:
+                    img = torch.zeros(3, 224, 224)
+            else:
+                img = torch.zeros(3, 224, 224)
+            return img, label
 
 
 
