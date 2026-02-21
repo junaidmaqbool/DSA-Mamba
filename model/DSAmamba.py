@@ -524,7 +524,7 @@ class SS_Conv_SSM(nn.Module):
         self.drop_path = DropPath(drop_path)
 
         if decoder:
-            self.cattn = CrossAttention(hidden_dim//2, key_dim=hidden_dim//2, value_dim=hidden_dim//2)
+            self.cattn = CrossAttention(hidden_dim, key_dim=hidden_dim, value_dim=hidden_dim)
 
         self.decompsition = series_decomp(kernel_size)
 
