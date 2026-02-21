@@ -6,6 +6,7 @@ import torch.nn.functional as F
 class CrossAttention(nn.Module):
     """
     Cross-Attention module that computes attention between query and key-value pairs.
+    Handles both 3D (B, N, C) and 4D (B, H, W, C) tensor inputs.
     
     Args:
         dim: Dimension of the query input
@@ -36,18 +37,27 @@ class CrossAttention(nn.Module):
     def forward(self, q, kv):
         """
         Args:
-            q: Query input tensor of shape (B, N, C)
-            kv: Key-value input tensor of shape (B, N, C)
+            q: Query input tensor of shape (B, N, C) or (B, H, W, C)
+            kv: Key-value input tensor of shape (B, N, C) or (B, H, W, C)
         
         Returns:
-            Output tensor of shape (B, N, C)
+            Output tensor with same shape as input
         """
+        # Handle 4D (B, H, W, C) tensors by flattening spatial dimensions
+        is_4d = q.dim() == 4
+        original_shape = None
+        if is_4d:
+            B, H, W, C = q.shape
+            original_shape = (B, H, W)
+            q = q.reshape(B, H*W, C)
+            kv = kv.reshape(kv.shape[0], -1, kv.shape[-1])
+        
         B, N, C = q.shape
         
         # Project query, key, value
         q = self.q_proj(q).reshape(B, N, self.num_heads, self.key_dim // self.num_heads).permute(0, 2, 1, 3)
-        k = self.k_proj(kv).reshape(B, N, self.num_heads, self.key_dim // self.num_heads).permute(0, 2, 1, 3)
-        v = self.v_proj(kv).reshape(B, N, self.num_heads, self.value_dim // self.num_heads).permute(0, 2, 1, 3)
+        k = self.k_proj(kv).reshape(B, kv.shape[1], self.num_heads, self.key_dim // self.num_heads).permute(0, 2, 1, 3)
+        v = self.v_proj(kv).reshape(B, kv.shape[1], self.num_heads, self.value_dim // self.num_heads).permute(0, 2, 1, 3)
         
         # Compute attention scores
         attn = (q @ k.transpose(-2, -1)) * self.scale
@@ -59,4 +69,9 @@ class CrossAttention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
         
+        # Reshape back to 4D if input was 4D
+        if is_4d:
+            x = x.reshape(*original_shape, -1)
+        
         return x
+

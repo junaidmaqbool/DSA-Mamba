@@ -2,6 +2,10 @@
 Logger module for tracking training metrics.
 """
 
+"""
+Logger module for tracking training metrics.
+"""
+
 import os
 import json
 from datetime import datetime
