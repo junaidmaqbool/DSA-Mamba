@@ -25,68 +25,88 @@ except ImportError:
     def selective_scan_fn(u, delta, A, B, C, D, z=None, delta_softplus=True, return_last_state=False):
         """
         Fallback selective scan implementation for when mamba_ssm is not available.
+        This is a simplified iterative implementation.
         
         Args:
-            u: input (B, D, L)
+            u: input (B, D, L) where D = K * d
             delta: delta (B, D, L)
             A: A matrix (D, N)
-            B: B matrix (B, N, L) or (B, 1, N, L)
-            C: C matrix (B, N, L) or (B, 1, N, L)
+            B: B matrix (B, K, N, L)
+            C: C matrix (B, K, N, L)  
             D: D vector (D,)
             z: Z for gating (B, D, L) or None
             delta_softplus: whether to apply softplus to delta
             return_last_state: whether to return last hidden state
         """
-        batch, d_model, seq_len = u.shape
-        n_state = A.shape[1]
+        batch, d_model, seq_len = u.shape  # (B, D, L)
+        n_state = A.shape[1]  # N
         
         if delta_softplus:
             delta = torch.nn.functional.softplus(delta)
         
-        # Reshape B and C if needed
-        if B.dim() == 3:  # (B, N, L) -> (B, 1, N, L)
-            B = B.unsqueeze(1)
-        if C.dim() == 3:  # (B, N, L) -> (B, 1, N, L)
-            C = C.unsqueeze(1)
+        D = D.view(-1)  # (D,)
         
-        # A: (D, N) -> reshape for broadcasting
-        # Compute: exp(delta * A) where delta is (B, D, 1)
-        # Result should be (B, D, N)
-        
-        D = D.view(-1)  # ensure 1D
-        
-        output = []
+        # Initialize hidden state
         h = torch.zeros(batch, d_model, n_state, dtype=u.dtype, device=u.device)
+        
+        output_list = []
         
         for i in range(seq_len):
             u_i = u[:, :, i]  # (B, D)
-            delta_i = delta[:, :, i]  # (B, D)
-            B_i = B[:, :, :, i]  # (B, 1, N)
-            C_i = C[:, :, :, i]  # (B, 1, N)
+            delta_i = delta[:, :, i]  # (B, D)  
+            B_i = B[:, :, :, i]  # (B, K, N)
+            C_i = C[:, :, :, i]  # (B, K, N)
             
-            # Compute: h = exp(delta * A) * h + (delta * B) * u
-            # delta_i: (B, D) -> (B, D, 1)
-            # A: (D, N)
-            # exp(delta * A): (B, D, N)
-            delta_A = delta_i.unsqueeze(-1) * A.unsqueeze(0)  # (B, D, N)
+            # Compute state transition: exp(delta * A)
+            # A: (D, N), delta_i: (B, D)
+            # Result: (B, D, N)
+            delta_A = delta_i.unsqueeze(-1) * A.unsqueeze(0)  # (B, D, 1) * (1, D, N) -> (B, D, N)
             exp_delta_A = torch.exp(delta_A)  # (B, D, N)
             
+            # Update hidden state: h = exp(delta * A) * h + delta * B * u
             h = h * exp_delta_A  # (B, D, N)
             
-            # Add input contribution: (delta * B) * u
-            # delta_i: (B, D, 1), B_i: (B, 1, N), u_i: (B, D, 1)
-            delta_B_u = (delta_i.unsqueeze(-1) * B_i) @ u_i.unsqueeze(-1)  # (B, D, N, 1) -> (B, D, N, 1)
-            delta_B_u = delta_B_u.squeeze(-1)  # (B, D, N)
-            h = h + delta_B_u
+            # Add input: delta * B * u
+            # Need to handle the K dimension properly
+            # B_i: (B, K, N), we need to aggregate or handle per-K
+            # For K=1 (which is the case here), squeeze that dimension
+            if B_i.shape[1] == 1:
+                B_i_squeezed = B_i.squeeze(1)  # (B, N)
+                # delta_i * u_i: (B, D), B_i_squeezed: (B, N)
+                # Need to project (B, D) through B_i (B, N)
+                # This represents: delta[b,d] * u[b,d] projected by B[b,n]
+                # We compute: sum_d (delta[b,d] * u[b,d]) * B[b,n] for each n
+                delta_u = delta_i * u_i  # (B, D) element-wise product
+                # Now project to state space: (B, D) -> (B, N) using B as projection
+                # For each batch b and state n: sum_d delta_u[b,d] * B[b,n]
+                # This is like taking a mass that scales with delta_u and spreading it across states
+                contribution = torch.einsum('bd,bn->bn', delta_u, B_i_squeezed)  # (B, N)
+                # Expand back to (B, D, N) by replicating across d dimension
+                contribution = contribution.unsqueeze(1).expand(batch, d_model, n_state)  # (B, D, N)
+            else:
+                # For K > 1, proper handling (not implemented in this fallback)
+                # Just use a simplified version
+                delta_u = delta_i * u_i  # (B, D)
+                B_i_mean = B_i.mean(dim=1)  # (B, N) - average across K
+                contribution = torch.einsum('bd,bn->bn', delta_u, B_i_mean)  # (B, N)
+                contribution = contribution.unsqueeze(1).expand(batch, d_model, n_state)
             
-            # Compute output: y = h * C + D * u
-            # h: (B, D, N), C_i: (B, 1, N) -> (B, D)
-            y_i = (h * C_i.transpose(1, 2)).sum(dim=-1)  # (B, D)
+            h = h + contribution  # (B, D, N)
+            
+            # Compute output: y = C * h + D * u
+            # C_i: (B, K, N), h: (B, D, N)
+            if C_i.shape[1] == 1:
+                C_i_squeezed = C_i.squeeze(1)  # (B, N)
+                # y[b, d] = sum_n C[b, n] * h[b, d, n] + D[d] * u[b, d]
+                y_i = torch.einsum('bn,bdn->bd', C_i_squeezed, h)  # (B, D)
+            else:
+                C_i_mean = C_i.mean(dim=1)  # (B, N)
+                y_i = torch.einsum('bn,bdn->bd', C_i_mean, h)
+            
             y_i = y_i + D * u_i  # (B, D)
-            
-            output.append(y_i)
+            output_list.append(y_i)
         
-        output = torch.stack(output, dim=-1)  # (B, D, L)
+        output = torch.stack(output_list, dim=-1)  # (B, D, L)
         
         if return_last_state:
             return output, h
