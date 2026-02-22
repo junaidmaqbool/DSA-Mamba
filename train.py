@@ -4,6 +4,7 @@ import json
 
 import torch
 import torch.nn as nn
+import time
 from torchvision import transforms, datasets
 from torchvision.datasets.folder import IMG_EXTENSIONS
 import torch.optim as optim
@@ -125,7 +126,7 @@ class HbImageDataset(torch.utils.data.Dataset):
             img = Image.open(path).convert('RGB')
             if self.transform is not None:
                 img = self.transform(img)
-            return img, label
+            return img, torch.tensor(label, dtype=torch.long)
         except Exception as e:
             print(f"Warning: Failed to load image at {path}: {e}. Returning a zero tensor instead.")
             # Return a zero tensor as fallback to prevent training interruption
@@ -138,7 +139,7 @@ class HbImageDataset(torch.utils.data.Dataset):
                     img = torch.zeros(3, 224, 224)
             else:
                 img = torch.zeros(3, 224, 224)
-            return img, label
+            return img, torch.tensor(label, dtype=torch.long)
 
 
 
@@ -372,6 +373,10 @@ def main():
     loss_function = nn.CrossEntropyLoss()
     optimizer = optim.Adam(net.parameters(), lr=0.0001)  # 0.0001
 
+    # Mixed precision (AMP) when using CUDA for speed
+    use_amp = device.type == 'cuda'
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+
     acc_logger = rl_plotter.logger.Logger(exp_name=model_name, env_name=args.env_name + '_acc')
     auc_logger = rl_plotter.logger.Logger(exp_name=model_name, env_name=args.env_name + '_auc')
     pre_logger = rl_plotter.logger.Logger(exp_name=model_name, env_name=args.env_name + '_precision')
@@ -389,17 +394,63 @@ def main():
         net.train()
         running_loss = 0.0
         train_bar = tqdm(train_loader, file=sys.stdout)
+
+        batch_times = []
         for steps, data in enumerate(train_bar):
+            t0 = time.time()
             images, labels = data
             optimizer.zero_grad()
 
-            labels = labels.squeeze().long().to(device)
-            outputs = net(images.to(device))
-            loss = loss_function(outputs, labels)
-            loss.backward()
-            optimizer.step()
+            # Ensure labels have batch dimension and move to device without blocking
+            try:
+                labels = labels.view(-1).long().to(device, non_blocking=True)
+            except Exception:
+                # fallback: try squeeze then ensure 1D
+                labels = labels.squeeze()
+                if labels.ndim == 0:
+                    labels = labels.unsqueeze(0)
+                labels = labels.long().to(device, non_blocking=True)
 
-            running_loss += loss.item()
+            # If labels tensor is empty for some reason, skip this batch
+            if labels.numel() == 0:
+                print(f"Skipping batch {steps}: empty labels tensor")
+                continue
+
+            # Move images to device using non_blocking for pinned memory
+            images = images.to(device, non_blocking=True)
+
+            # Forward/backward with optional AMP
+            try:
+                if use_amp:
+                    with torch.cuda.amp.autocast():
+                        outputs = net(images)
+                        # If shapes mismatch, skip batch (report and continue)
+                        if outputs.shape[0] != labels.shape[0]:
+                            print(f"Skipping batch {steps}: outputs batch {outputs.shape[0]} != labels batch {labels.shape[0]}")
+                            continue
+                        loss = loss_function(outputs, labels)
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    outputs = net(images)
+                    if outputs.shape[0] != labels.shape[0]:
+                        print(f"Skipping batch {steps}: outputs batch {outputs.shape[0]} != labels batch {labels.shape[0]}")
+                        continue
+                    loss = loss_function(outputs, labels)
+                    loss.backward()
+                    optimizer.step()
+            except Exception as e:
+                print(f"Error processing batch {steps}: {e}")
+                continue
+
+            running_loss += float(loss.item())
+            t1 = time.time()
+            batch_times.append(t1 - t0)
+
+            # update progress description with recent loss and avg batch time
+            avg_bt = (sum(batch_times) / len(batch_times)) if batch_times else 0.0
+            train_bar.desc = f"train epoch[{epoch + 1}/{args.epochs}] loss:{loss:.3f} avg_batch_time:{avg_bt:.3f}s"
 
             train_bar.desc = "train epoch[{}/{}] loss:{:.3f}".format(epoch + 1,
                                                                      args.epochs,
