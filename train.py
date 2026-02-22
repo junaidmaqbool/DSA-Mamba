@@ -11,6 +11,7 @@ import torch.optim as optim
 from tqdm import tqdm
 
 from model.DSAmamba import VSSM as dsamamba  # import model
+from eval_and_plot import evaluate_and_plot, plot_training_history  # evaluation and plotting
 
 
 import rl_plotter
@@ -377,6 +378,7 @@ def main():
     use_amp = device.type == 'cuda'
     scaler = torch.cuda.amp.GradScaler() if use_amp else None
 
+    loss_logger = rl_plotter.logger.Logger(exp_name=model_name, env_name=args.env_name + '_loss')
     acc_logger = rl_plotter.logger.Logger(exp_name=model_name, env_name=args.env_name + '_acc')
     auc_logger = rl_plotter.logger.Logger(exp_name=model_name, env_name=args.env_name + '_auc')
     pre_logger = rl_plotter.logger.Logger(exp_name=model_name, env_name=args.env_name + '_precision')
@@ -464,6 +466,8 @@ def main():
             '[epoch %d] train_loss: %.3f  val_accuracy: %.3f, auc: %.3f, precision: %.3f, sensitivity: %.3f, f1: %.3f, specificity: %.3f' %
             (epoch + 1, running_loss / train_steps, val_accurate, auc, precision, sensitivity, f1, specificity))
 
+        # Log all metrics
+        loss_logger.update(score=[running_loss / train_steps], total_steps=epoch + 1)
         acc_logger.update(score=[val_accurate], total_steps=epoch + 1)
         auc_logger.update(score=[auc], total_steps=epoch + 1)
         pre_logger.update(score=[precision], total_steps=epoch + 1)
@@ -477,6 +481,39 @@ def main():
             print(f"New best model saved to {save_path} with accuracy: {best_acc:.4f}")
 
     print('Finished Training')
+    print("\n" + "="*60)
+    print("GENERATING EVALUATION AND PLOTS")
+    print("="*60)
+    
+    # Run evaluation and generate plots
+    try:
+        evaluate_and_plot(
+            model=net,
+            val_loader=validate_loader,
+            model_path=save_path,
+            device=device,
+            exp_name='dsamamba',
+            log_dir='./logs',
+            output_dir='./eval_results'
+        )
+        
+        # Plot training history metrics
+        plot_training_history('dsamamba', log_dir='./logs', output_dir='./eval_results')
+        
+        print("\n✓ All evaluation plots saved to ./eval_results/")
+        print("\nGenerated files:")
+        print("  - dsamamba_confusion_matrix.png")
+        print("  - dsamamba_roc_curve.png")
+        print("  - dsamamba_class_distribution.png")
+        print("  - dsamamba_metrics_summary.png")
+        print("  - dsamamba_training_loss.png")
+        print("  - dsamamba_validation_metrics.png")
+        print("  - dsamamba_results.json")
+        print("="*60)
+    except Exception as e:
+        print(f"Warning: Evaluation or plotting failed: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 # Function to calculate metrics
