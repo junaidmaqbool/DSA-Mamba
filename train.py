@@ -185,6 +185,14 @@ def main():
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print("using {} device.".format(device))
+    
+    # Enable CUDA optimizations for better performance
+    if device.type == 'cuda':
+        torch.backends.cudnn.benchmark = True
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"CUDA Version: {torch.version.cuda}")
+        print(f"cuDNN Enabled: {torch.backends.cudnn.enabled}")
+        print(f"Available GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
 
     if args.medmnist is False:
         data_transform = {
@@ -253,9 +261,9 @@ def main():
             val_num = len(validate_dataset)
 
             train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                                                       num_workers=args.num_works)
+                                                       num_workers=args.num_works, pin_memory=True)
             validate_loader = torch.utils.data.DataLoader(validate_dataset, batch_size=args.batch_size, shuffle=False,
-                                                          num_workers=args.num_works)
+                                                          num_workers=args.num_works, pin_memory=True)
             print(f"using {train_num} images for training, {val_num} images for validation (from mapping).")
             # Skip the rest of folder-based handling
         else:
@@ -274,9 +282,9 @@ def main():
                     json_file.write(json_str)
 
                 train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                                                        num_workers=args.num_works)
+                                                        num_workers=args.num_works, pin_memory=True)
                 validate_loader = torch.utils.data.DataLoader(validate_dataset, batch_size=args.batch_size, shuffle=False,
-                                                            num_workers=args.num_works)
+                                                            num_workers=args.num_works, pin_memory=True)
                 print("using {} images for training, {} images for validation.".format(train_num, val_num))
             else:
                 # Single root provided: use ImageFolder and split into train/val GG 
@@ -307,9 +315,9 @@ def main():
                 val_num = val_len
 
                 train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                                                        num_workers=args.num_works)
+                                                        num_workers=args.num_works, pin_memory=True)
                 validate_loader = torch.utils.data.DataLoader(validate_dataset, batch_size=args.batch_size, shuffle=False,
-                                                            num_workers=args.num_works)
+                                                            num_workers=args.num_works, pin_memory=True)
                 print(f"Dynamically split {total} images -> {train_num} train, {val_num} val (val_split={val_frac})")
     else:
         print('use medmnist datasets')
@@ -340,9 +348,9 @@ def main():
         # test_dataset = DataClass(split='test', transform=data_transform, download=args.medmnist_download)
 
         train_loader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=args.batch_size, shuffle=True,
-                                                   num_workers=args.num_works)
+                                                   num_workers=args.num_works, pin_memory=True)
         validate_loader = torch.utils.data.DataLoader(dataset=val_dataset, batch_size=args.batch_size, shuffle=False,
-                                                      num_workers=args.num_works)
+                                                      num_workers=args.num_works, pin_memory=True)
         # test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_works)
         print("using {} images for training, {} images for validation.".format(train_num, val_num))
 
@@ -351,6 +359,16 @@ def main():
 
     best_acc = 0.0
     net.to(device)
+    
+    # Pre-initialize lazy layers to avoid overhead during training
+    print("Pre-initializing lazy layers...")
+    try:
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 3, 224, 224, device=device)
+            _ = net(dummy_input)
+        print("Lazy layers pre-initialized successfully")
+    except Exception as e:
+        print(f"Note: Pre-initialization skipped ({str(e)[:50]}), will initialize on first training step")
     loss_function = nn.CrossEntropyLoss()
     optimizer = optim.Adam(net.parameters(), lr=0.0001)  # 0.0001
 
