@@ -1,26 +1,28 @@
 import os
 import sys
-import json
 import argparse
 import time
-import math
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import transforms, datasets
+from torchvision import transforms
 from torchvision.datasets.folder import IMG_EXTENSIONS
 from PIL import Image
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 from model.DSAmamba import VSSM as dsamamba
 
 
 class HbRegressionDataset(torch.utils.data.Dataset):
-    """Dataset that returns (image, hb_value_float) from a mapping file or dataframe."""
-    def __init__(self, images_dir, mapping_df, image_col='image_name', hb_col='hb', transform=None):
+    """Dataset that returns (image, hb_value) where hb_value is normalized if scaler provided.
+
+    samples list stores tuples (path, hb_original_float) so we can later use original values for denorm.
+    """
+    def __init__(self, images_dir, mapping_df, image_col='image_name', hb_col='hb', transform=None, scaler=None):
         self.images_dir = images_dir
         if isinstance(mapping_df, str):
             if mapping_df.lower().endswith('.csv'):
@@ -37,6 +39,7 @@ class HbRegressionDataset(torch.utils.data.Dataset):
         self.image_col = image_col
         self.hb_col = hb_col
         self.transform = transform
+        self.scaler = scaler
 
         self.samples = []
         skipped = 0
@@ -89,12 +92,24 @@ class HbRegressionDataset(torch.utils.data.Dataset):
             img = Image.open(path).convert('RGB')
             if self.transform is not None:
                 img = self.transform(img)
+            if self.scaler is not None:
+                mean, std = self.scaler
+                if std == 0 or np.isnan(std):
+                    std = 1.0
+                hb_norm = (hb_val - mean) / std
+                return img, torch.tensor(hb_norm, dtype=torch.float32)
             return img, torch.tensor(hb_val, dtype=torch.float32)
-        except Exception as e:
+        except Exception:
             # fallback zero image
             img = Image.new('RGB', (224, 224))
             if self.transform is not None:
                 img = self.transform(img)
+            if self.scaler is not None:
+                mean, std = self.scaler
+                if std == 0 or np.isnan(std):
+                    std = 1.0
+                hb_norm = (hb_val - mean) / std
+                return img, torch.tensor(hb_norm, dtype=torch.float32)
             return img, torch.tensor(hb_val, dtype=torch.float32)
 
 
@@ -107,7 +122,6 @@ def rmse(y_true, y_pred):
 
 
 def mape(y_true, y_pred):
-    # avoid division by zero: ignore zero true values in denominator
     y_true = np.array(y_true)
     y_pred = np.array(y_pred)
     denom = np.where(y_true == 0, np.nan, y_true)
@@ -153,7 +167,6 @@ def main():
     }
 
     if args.csv_path is None:
-        # fallback to ImageFolder regression is not supported, so require csv mapping
         raise RuntimeError('Please provide --csv-path mapping file with image filenames and hb values for regression')
 
     # read mapping
@@ -165,7 +178,6 @@ def main():
         except Exception:
             mapping_df = pd.read_csv(args.csv_path)
 
-    # split mapping
     total_rows = len(mapping_df)
     if total_rows == 0:
         raise RuntimeError('Mapping file is empty')
@@ -179,10 +191,19 @@ def main():
     train_df = mapping_df.iloc[:train_len].reset_index(drop=True)
     val_df = mapping_df.iloc[train_len:train_len+val_len].reset_index(drop=True)
 
+    # compute scaler from training hb values
+    hb_series = train_df[args.hb_col].astype(float)
+    hb_mean = float(hb_series.mean())
+    hb_std = float(hb_series.std())
+    if hb_std == 0 or np.isnan(hb_std):
+        hb_std = 1.0
+    scaler = (hb_mean, hb_std)
+    print(f"Using HB scaler mean={hb_mean:.3f}, std={hb_std:.3f}")
+
     train_dataset = HbRegressionDataset(args.train_dataset_path, train_df, image_col=args.image_col,
-                                        hb_col=args.hb_col, transform=data_transform['train'])
+                                        hb_col=args.hb_col, transform=data_transform['train'], scaler=scaler)
     val_dataset = HbRegressionDataset(args.train_dataset_path, val_df, image_col=args.image_col,
-                                      hb_col=args.hb_col, transform=data_transform['val'])
+                                      hb_col=args.hb_col, transform=data_transform['val'], scaler=scaler)
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
@@ -201,6 +222,11 @@ def main():
     criterion = nn.MSELoss()
     optimizer = optim.Adam(net.parameters(), lr=float(args.lr))
 
+    train_losses = []
+    val_mae_list = []
+    val_rmse_list = []
+    val_mape_list = []
+
     for epoch in range(args.epochs):
         net.train()
         running_loss = 0.0
@@ -211,7 +237,6 @@ def main():
 
             optimizer.zero_grad()
             outputs = net(images)
-            # outputs shape (B,1)
             loss = criterion(outputs, hb_vals)
             loss.backward()
             optimizer.step()
@@ -220,9 +245,10 @@ def main():
             pbar.set_postfix(loss=running_loss / (pbar.n + 1))
 
         avg_loss = running_loss / max(1, len(train_loader))
+        train_losses.append(avg_loss)
         print(f"Epoch {epoch+1}/{args.epochs} train_loss: {avg_loss:.4f}")
 
-        # validation metrics
+        # validation metrics (denormalize for reporting)
         net.eval()
         all_preds = []
         all_trues = []
@@ -232,30 +258,36 @@ def main():
                 outputs = net(images)
                 outputs = outputs.squeeze().cpu().numpy()
                 trues = hb_vals.cpu().numpy().astype(float)
-                all_preds.extend(outputs.tolist())
-                all_trues.extend(trues.tolist())
+                # denormalize
+                preds_denorm = (outputs * hb_std) + hb_mean
+                trues_denorm = (trues * hb_std) + hb_mean
+                all_preds.extend(np.atleast_1d(preds_denorm).tolist())
+                all_trues.extend(np.atleast_1d(trues_denorm).tolist())
 
         all_preds = np.array(all_preds)
         all_trues = np.array(all_trues)
         val_mae = mae(all_trues, all_preds)
         val_rmse = rmse(all_trues, all_preds)
         val_mape = mape(all_trues, all_preds)
+        val_mae_list.append(val_mae)
+        val_rmse_list.append(val_rmse)
+        val_mape_list.append(val_mape)
         print(f"Validation MAE: {val_mae:.4f}, RMSE: {val_rmse:.4f}, MAPE(%): {val_mape:.2f}")
 
-    # Final evaluation and printouts on validation (test) set
+    # Final evaluation on validation set using stored sample paths (denormalize predictions)
     print('\nFinal evaluation on validation set:')
     net.eval()
     preds = []
     trues = []
-    paths = []
     with torch.no_grad():
-        for img, hb in val_dataset:
-            x = img.unsqueeze(0).to(device)
-            out = net(x).squeeze().cpu().item()
-            preds.append(float(out))
-            trues.append(float(hb))
-            # find path in samples stored
-            # val_dataset.samples corresponds order
+        for path, hb_true in val_dataset.samples:
+            img = Image.open(path).convert('RGB')
+            img_t = data_transform['val'](img).unsqueeze(0).to(device)
+            out_norm = net(img_t).squeeze().cpu().item()
+            out_denorm = out_norm * hb_std + hb_mean
+            preds.append(float(out_denorm))
+            trues.append(float(hb_true))
+
     preds = np.array(preds)
     trues = np.array(trues)
     print(f"Samples evaluated: {len(preds)}")
@@ -267,6 +299,57 @@ def main():
     print('\nActual vs Predicted (validation set):')
     for (p, hb_val), pred in zip(val_dataset.samples, preds.tolist()):
         print(f"{os.path.basename(p)}\ttrue: {hb_val:.2f}\tpred: {pred:.2f}")
+
+    # Create plots directory and save graphs
+    os.makedirs('eval_results', exist_ok=True)
+
+    try:
+        plt.figure()
+        plt.plot(range(1, len(train_losses)+1), train_losses, marker='o')
+        plt.xlabel('Epoch')
+        plt.ylabel('Train Loss (MSE on normalized HB)')
+        plt.title('Training Loss')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig('eval_results/train_loss.png')
+        plt.close()
+    except Exception as e:
+        print('Warning: failed to save train loss plot:', e)
+
+    try:
+        plt.figure()
+        epochs = range(1, len(val_mae_list)+1)
+        plt.plot(epochs, val_mae_list, label='MAE')
+        plt.plot(epochs, val_rmse_list, label='RMSE')
+        plt.plot(epochs, val_mape_list, label='MAPE (%)')
+        plt.xlabel('Epoch')
+        plt.ylabel('Metric')
+        plt.title('Validation Metrics (denormalized)')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig('eval_results/val_metrics.png')
+        plt.close()
+    except Exception as e:
+        print('Warning: failed to save validation metrics plot:', e)
+
+    try:
+        plt.figure(figsize=(6,6))
+        plt.scatter(trues, preds, alpha=0.6)
+        if len(trues) > 0 and len(preds) > 0:
+            mn = min(min(trues), min(preds))
+            mx = max(max(trues), max(preds))
+            plt.plot([mn, mx], [mn, mx], 'r--')
+        plt.xlabel('Actual HB')
+        plt.ylabel('Predicted HB')
+        plt.title('Predicted vs Actual HB (validation)')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig('eval_results/pred_vs_actual.png')
+        plt.close()
+        print('\nSaved plots to eval_results/')
+    except Exception as e:
+        print('Warning: failed to save pred vs actual plot:', e)
 
 
 if __name__ == '__main__':
