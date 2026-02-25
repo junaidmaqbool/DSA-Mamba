@@ -62,6 +62,10 @@ def load_pretrained_backbone_weights(model, pretrained_model_name='resnet50', de
                     pretrained_conv = pretrained.conv1.weight  # [64, 3, 7, 7]
                     model_proj = patch_embed.proj.weight  # [embed_dim, 3, patch_size, patch_size]
                     
+                    # Get device from model to ensure weights are on correct device
+                    model_device = model_proj.device
+                    pretrained_conv = pretrained_conv.to(model_device)
+                    
                     # Average pool the pretrained weights to match our spatial size
                     if pretrained_conv.shape != model_proj.shape:
                         pretrained_conv = F.adaptive_avg_pool2d(
