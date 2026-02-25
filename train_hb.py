@@ -146,6 +146,9 @@ def get_args_parser():
     parser.add_argument('--weight-decay', default=1e-4, type=float)
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--save-dir', default='checkpoints', type=str)
+    parser.add_argument('--resume-from', default=None, type=str, help='Path to checkpoint to resume from')
+    parser.add_argument('--use-range-loss', default=True, type=bool, help='Use range-encouraging loss term')
+    parser.add_argument('--warmup-epochs', default=5, type=int, help='Number of warmup epochs')
     return parser
 
 
@@ -233,19 +236,43 @@ def main():
     except Exception:
         pass
 
-    # Use Huber (Smooth L1) loss for robustness to outliers
-    criterion = nn.SmoothL1Loss()
-    # AdamW with weight decay for better generalization
-    optimizer = optim.AdamW(net.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
-    # Reduce LR when validation plateaus
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    # Load checkpoint if provided
+    start_epoch = 0
+    if args.resume_from is not None and os.path.exists(args.resume_from):
+        print(f"Loading checkpoint from {args.resume_from}")
+        checkpoint = torch.load(args.resume_from, map_location=device)
+        if isinstance(checkpoint, dict) and 'model_state' in checkpoint:
+            net.load_state_dict(checkpoint['model_state'])
+            start_epoch = checkpoint.get('epoch', 0) + 1
+        else:
+            net.load_state_dict(checkpoint)
+    
+    # Improve head initialization for regression - initialize to predict range center
+    with torch.no_grad():
+        if hasattr(net, 'head') and isinstance(net.head, nn.Linear):
+            # Initialize with small values to allow learning
+            nn.init.normal_(net.head.weight, mean=0, std=0.01)  
+            nn.init.constant_(net.head.bias, 0.0)
+
+    # Use MSE loss for regression (more aggressive than SmoothL1)
+    criterion = nn.MSELoss()
+    
+    # Higher learning rate for better convergence + weight decay for regularization
+    base_lr = float(args.lr) * 5  # Increase base LR for better learning
+    optimizer = optim.AdamW(net.parameters(), lr=base_lr, weight_decay=float(args.weight_decay), betas=(0.9, 0.999))
+    
+    # Cosine annealing with warm restarts for better exploration
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=10, T_mult=2, eta_min=float(args.lr) * 0.1, verbose=True
+    )
 
     train_losses = []
     val_mae_list = []
     val_rmse_list = []
     val_mape_list = []
+    best_val_mae = float('inf')
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         net.train()
         running_loss = 0.0
         pbar = tqdm(train_loader, file=sys.stdout, desc=f"Train Epoch {epoch+1}/{args.epochs}")
@@ -255,14 +282,34 @@ def main():
 
             optimizer.zero_grad()
             outputs = net(images)
+            
+            # Main MSE loss
             loss = criterion(outputs, hb_vals)
+            
+            # Add auxiliary losses to encourage full range predictions
+            if args.use_range_loss:
+                # Variance loss: encourage outputs to have similar variance to targets
+                output_std = torch.std(outputs)
+                target_std = torch.std(hb_vals)
+                if output_std > 1e-6:
+                    variance_loss = 0.1 * ((output_std - target_std) ** 2)
+                    loss = loss + variance_loss
+                
+                # Range loss: penalize predictions far from target range
+                output_range = torch.max(outputs) - torch.min(outputs)
+                target_range = torch.max(hb_vals) - torch.min(hb_vals)
+                if output_range > 1e-6 and target_range > 1e-6:
+                    range_loss = 0.05 * ((output_range - target_range) ** 2) / (target_range ** 2)
+                    loss = loss + range_loss
+            
             loss.backward()
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+            
+            # Aggressive gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=2.0)
             optimizer.step()
 
             running_loss += float(loss.item())
-            pbar.set_postfix(loss=running_loss / (pbar.n + 1))
+            pbar.set_postfix(loss=running_loss / (pbar.n + 1), lr=f"{optimizer.param_groups[0]['lr']:.2e}")
 
         avg_loss = running_loss / max(1, len(train_loader))
         train_losses.append(avg_loss)
@@ -293,23 +340,31 @@ def main():
         val_rmse_list.append(val_rmse)
         val_mape_list.append(val_mape)
         print(f"Validation MAE: {val_mae:.4f}, RMSE: {val_rmse:.4f}, MAPE(%): {val_mape:.2f}")
-        # step scheduler on validation MAE
+        print(f"Pred range: [{all_preds.min():.2f}, {all_preds.max():.2f}] | True range: [{all_trues.min():.2f}, {all_trues.max():.2f}]")
+        
+        # Step scheduler every epoch
         try:
-            scheduler.step(val_mae)
-        except Exception:
-            pass
-
-        # Save best model by MAE
+            scheduler.step()
+        except Exception as e:
+            print(f"Scheduler step error: {e}")
+        
+        # Save best model by MAE and every 5 epochs
         os.makedirs(args.save_dir, exist_ok=True)
-        if epoch == 0:
+        if val_mae < best_val_mae:
             best_val_mae = val_mae
-            torch.save({'epoch': epoch, 'model_state': net.state_dict(), 'optimizer_state': optimizer.state_dict()},
-                       os.path.join(args.save_dir, 'best_model.pth'))
-        else:
-            if val_mae < best_val_mae:
-                best_val_mae = val_mae
-                torch.save({'epoch': epoch, 'model_state': net.state_dict(), 'optimizer_state': optimizer.state_dict()},
-                           os.path.join(args.save_dir, 'best_model.pth'))
+            torch.save(
+                {'epoch': epoch, 'model_state': net.state_dict(), 'optimizer_state': optimizer.state_dict(),
+                 'val_mae': val_mae, 'val_rmse': val_rmse},
+                os.path.join(args.save_dir, 'best_model.pth')
+            )
+            print(f"✓ Saved best model with MAE: {val_mae:.4f}")
+        
+        # Save checkpoint every 5 epochs
+        if (epoch + 1) % 5 == 0:
+            torch.save(
+                {'epoch': epoch, 'model_state': net.state_dict(), 'optimizer_state': optimizer.state_dict()},
+                os.path.join(args.save_dir, f'checkpoint_epoch_{epoch+1}.pth')
+            )
 
     # Final evaluation on validation set using stored sample paths (denormalize predictions)
     print('\nFinal evaluation on validation set:')
