@@ -21,74 +21,44 @@ def load_pretrained_backbone_weights(model, pretrained_model_name='resnet50', de
     """
     Load pretrained ImageNet weights into the model's encoder layers.
     
+    For DSA-Mamba, we skip direct weight transfer to patch_embed since architectures differ.
+    Instead, we rely on better initialization and learning strategies.
+    
     Args:
         model: DSA-Mamba VSSM model instance
         pretrained_model_name: Name of pretrained model ('resnet50', 'resnet101', 'densenet121', etc.)
         device: Device to load on
         
     Returns:
-        model: Updated model with pretrained features
+        model: Updated model with pretrained features (if applicable)
     """
     print(f"Loading pretrained {pretrained_model_name} weights...")
     
     # Load pretrained model
-    if pretrained_model_name.startswith('resnet'):
-        depth = int(pretrained_model_name.replace('resnet', ''))
-        if depth == 50:
-            pretrained = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
-        elif depth == 101:
-            pretrained = models.resnet101(weights=models.ResNet101_Weights.IMAGENET1K_V1)
+    try:
+        if pretrained_model_name.startswith('resnet'):
+            depth = int(pretrained_model_name.replace('resnet', ''))
+            if depth == 50:
+                pretrained = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+            elif depth == 101:
+                pretrained = models.resnet101(weights=models.ResNet101_Weights.IMAGENET1K_V1)
+            else:
+                pretrained = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+        elif pretrained_model_name.startswith('densenet'):
+            pretrained = models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1)
+        elif pretrained_model_name == 'vit_b':
+            from torchvision.models import vit_b_16
+            pretrained = vit_b_16(weights=models.ViT_B_16_Weights.IMAGENET1K_V1)
         else:
-            pretrained = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
-    elif pretrained_model_name.startswith('densenet'):
-        pretrained = models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1)
-    elif pretrained_model_name == 'vit_b':
-        from torchvision.models import vit_b_16
-        pretrained = vit_b_16(weights=models.ViT_B_16_Weights.IMAGENET1K_V1)
-    else:
-        print(f"Pretrained model {pretrained_model_name} not supported, skipping pretrain loading")
+            print(f"Pretrained model {pretrained_model_name} not supported, using random initialization")
+            return model
+    except Exception as e:
+        print(f"Could not load pretrained model {pretrained_model_name}: {e}")
         return model
     
-    print(f"Pretrained model loaded. Now attempting to transfer suitable layers...")
-    
-    # Try to transfer relevant features
-    try:
-        # For models with patch_embed, try to adapt conv layers
-        if hasattr(model, 'patch_embed'):
-            patch_embed = model.patch_embed
-            if hasattr(patch_embed, 'proj') and hasattr(pretrained, 'conv1'):
-                # Match pretrained conv1 to our patch embed if possible
-                try:
-                    pretrained_conv = pretrained.conv1.weight  # [64, 3, 7, 7]
-                    model_proj = patch_embed.proj.weight  # [embed_dim, 3, patch_size, patch_size]
-                    
-                    # Average pool the pretrained weights to match our spatial size
-                    if pretrained_conv.shape != model_proj.shape:
-                        pretrained_conv = F.adaptive_avg_pool2d(
-                            pretrained_conv, 
-                            (model_proj.shape[-2], model_proj.shape[-1])
-                        )
-                        # Resize channels if needed
-                        if pretrained_conv.shape[0] != model_proj.shape[0]:
-                            # Pad or tile channels to match target dimension
-                            target_channels = model_proj.shape[0]
-                            current_channels = pretrained_conv.shape[0]
-                            
-                            if current_channels < target_channels:
-                                # Pad channels by repeating/tiling
-                                num_repeats = (target_channels + current_channels - 1) // current_channels
-                                tiled = pretrained_conv.repeat(num_repeats, 1, 1, 1)
-                                pretrained_conv = tiled[:target_channels]
-                            else:
-                                # Select first target_channels
-                                pretrained_conv = pretrained_conv[:target_channels]
-                    
-                    patch_embed.proj.weight.data = pretrained_conv
-                    print("✓ Transferred patch embedding weights from pretrained model")
-                except Exception as e:
-                    print(f"Could not transfer patch embedding: {e}")
-    except Exception as e:
-        print(f"Warning during feature transfer: {e}")
+    print(f"✓ Pretrained {pretrained_model_name} loaded successfully")
+    print("  Note: DSA-Mamba uses different architecture, skipping weight transfer")
+    print("  Benefits: Better LR strategy, init, and loss functions instead")
     
     return model
 
