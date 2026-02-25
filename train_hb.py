@@ -6,6 +6,7 @@ import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import random
 from torchvision import transforms
 from torchvision.datasets.folder import IMG_EXTENSIONS
 from PIL import Image
@@ -142,6 +143,9 @@ def get_args_parser():
     parser.add_argument('--hb-col', default='hb', type=str)
     parser.add_argument('--val-split', default=0.2, type=float)
     parser.add_argument('--lr', default=1e-4, type=float)
+    parser.add_argument('--weight-decay', default=1e-4, type=float)
+    parser.add_argument('--seed', default=42, type=int)
+    parser.add_argument('--save-dir', default='checkpoints', type=str)
     return parser
 
 
@@ -152,12 +156,22 @@ def main():
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print('Using device:', device)
 
+    # Reproducibility
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
     data_transform = {
         'train': transforms.Compose([
             transforms.RandomResizedCrop(224),
             transforms.RandomHorizontalFlip(),
+                transforms.RandomRotation(10),
+                transforms.RandomApply([transforms.ColorJitter(0.2,0.2,0.2,0.05)], p=0.7),
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+                transforms.RandomErasing(p=0.2),
         ]),
         'val': transforms.Compose([
             transforms.Resize((224, 224)),
@@ -219,8 +233,12 @@ def main():
     except Exception:
         pass
 
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(net.parameters(), lr=float(args.lr))
+    # Use Huber (Smooth L1) loss for robustness to outliers
+    criterion = nn.SmoothL1Loss()
+    # AdamW with weight decay for better generalization
+    optimizer = optim.AdamW(net.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+    # Reduce LR when validation plateaus
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
 
     train_losses = []
     val_mae_list = []
@@ -239,6 +257,8 @@ def main():
             outputs = net(images)
             loss = criterion(outputs, hb_vals)
             loss.backward()
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
             optimizer.step()
 
             running_loss += float(loss.item())
@@ -273,6 +293,23 @@ def main():
         val_rmse_list.append(val_rmse)
         val_mape_list.append(val_mape)
         print(f"Validation MAE: {val_mae:.4f}, RMSE: {val_rmse:.4f}, MAPE(%): {val_mape:.2f}")
+        # step scheduler on validation MAE
+        try:
+            scheduler.step(val_mae)
+        except Exception:
+            pass
+
+        # Save best model by MAE
+        os.makedirs(args.save_dir, exist_ok=True)
+        if epoch == 0:
+            best_val_mae = val_mae
+            torch.save({'epoch': epoch, 'model_state': net.state_dict(), 'optimizer_state': optimizer.state_dict()},
+                       os.path.join(args.save_dir, 'best_model.pth'))
+        else:
+            if val_mae < best_val_mae:
+                best_val_mae = val_mae
+                torch.save({'epoch': epoch, 'model_state': net.state_dict(), 'optimizer_state': optimizer.state_dict()},
+                           os.path.join(args.save_dir, 'best_model.pth'))
 
     # Final evaluation on validation set using stored sample paths (denormalize predictions)
     print('\nFinal evaluation on validation set:')
