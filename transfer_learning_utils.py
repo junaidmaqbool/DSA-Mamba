@@ -148,8 +148,9 @@ def create_optimizer_with_lr_decay(model, base_lr=1e-4, weight_decay=1e-4, backb
     
     # Backbone gets lower learning rate for fine-tuning
     if backbone_params:
+        # convert list to tuple to avoid foreach dispatch issues
         param_groups.append({
-            'params': backbone_params,
+            'params': tuple(backbone_params),
             'lr': base_lr * backbone_lr_factor,
             'weight_decay': weight_decay
         })
@@ -157,12 +158,13 @@ def create_optimizer_with_lr_decay(model, base_lr=1e-4, weight_decay=1e-4, backb
     # Head gets full learning rate
     if head_params:
         param_groups.append({
-            'params': head_params,
+            'params': tuple(head_params),
             'lr': base_lr,
             'weight_decay': weight_decay
         })
     
-    optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.999))
+    # Disable foreach to avoid _foreach_* API expecting tuples
+    optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.999), foreach=False)
     print(f"Optimizer created with differentiated LR:")
     print(f"  Backbone LR: {base_lr * backbone_lr_factor:.2e}")
     print(f"  Head LR: {base_lr:.2e}")
