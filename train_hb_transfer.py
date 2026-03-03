@@ -171,8 +171,17 @@ def get_args_parser():
     parser.add_argument('--backbone-lr-factor', default=0.1, type=float, 
                        help='LR factor for backbone vs head')
     parser.add_argument('--warmup-epochs', default=5, type=int, help='Warmup epochs')
-    parser.add_argument('--use-range-loss', default=True, type=bool, 
-                       help='Use range-aware loss')
+    parser.add_argument('--loss-type', default='range', type=str,
+                       choices=['mse','mae','huber','range'],
+                       help='Type of loss to use (range uses custom RegressionLossWithRangeAwareness)')
+    parser.add_argument('--balance-sampler', default=False, type=bool,
+                       help='Use weighted sampler to balance training hb distribution')
+    parser.add_argument('--freeze-backbone-epochs', default=0, type=int,
+                       help='Number of epochs to freeze backbone weights at start')
+    parser.add_argument('--early-stopping-patience', default=0, type=int,
+                       help='Stop training if validation MAE does not improve for this many epochs (0 to disable)')
+    parser.add_argument('--use-plateau-scheduler', default=False, type=bool,
+                       help='Use ReduceLROnPlateau scheduler based on val MAE')
     return parser
 
 
@@ -243,7 +252,7 @@ def main():
     print(f"HB Statistics - Mean: {hb_mean:.3f}, Std: {hb_std:.3f}, "
           f"Range: [{hb_series.min():.1f}, {hb_series.max():.1f}]")
 
-    # Create datasets and loaders
+    # Create datasets
     train_dataset = HbRegressionDataset(args.train_dataset_path, train_df, 
                                        image_col=args.image_col, hb_col=args.hb_col, 
                                        transform=data_transform['train'], scaler=scaler)
@@ -251,14 +260,44 @@ def main():
                                      image_col=args.image_col, hb_col=args.hb_col, 
                                      transform=data_transform['val'], scaler=scaler)
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, 
-                                              shuffle=True, num_workers=4)
+    # optionally balance by hb distribution using weighted sampler
+    if args.balance_sampler:
+        # compute weights inversely proportional to frequency in bins
+        hb_vals = np.array([hb for _, hb in train_dataset.samples])
+        if hb_vals.size > 0:
+            num_bins = min(10, len(hb_vals))
+            bins = np.linspace(hb_vals.min(), hb_vals.max(), num_bins + 1)
+            bin_idx = np.digitize(hb_vals, bins)  # 1..num_bins
+            counts = np.bincount(bin_idx, minlength=num_bins+1)
+            # avoid division by zero
+            counts = counts.astype(float)
+            counts[counts == 0] = 1.0
+            weights = 1.0 / counts[bin_idx]
+            weights = torch.tensor(weights, dtype=torch.double)
+            sampler = torch.utils.data.WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+            train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size,
+                                                      sampler=sampler, num_workers=4)
+            print("Using weighted sampler to balance training distribution")
+        else:
+            train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size,
+                                                      shuffle=True, num_workers=4)
+    else:
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, 
+                                                  shuffle=True, num_workers=4)
+
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, 
                                             shuffle=False, num_workers=4)
 
     # Create model
     net = dsamamba(in_chans=args.n_channels, num_classes=1)
     net.to(device)
+
+    # optionally freeze backbone for a few epochs
+    if args.freeze_backbone_epochs > 0:
+        for name, param in net.named_parameters():
+            if 'head' not in name:
+                param.requires_grad = False
+        print(f"Backbone frozen for first {args.freeze_backbone_epochs} epochs")
 
     # Pre-init lazy layers
     try:
@@ -291,10 +330,27 @@ def main():
                                               weight_decay=args.weight_decay,
                                               backbone_lr_factor=args.backbone_lr_factor)
 
-    # Create loss and scheduler
-    criterion = RegressionLossWithRangeAwareness(variance_weight=0.1, range_weight=0.05) if args.use_range_loss else nn.MSELoss()
-    scheduler = create_warmup_scheduler(optimizer, warmup_epochs=args.warmup_epochs, 
-                                       total_epochs=args.epochs)
+    # Create loss
+    if args.loss_type == 'mse':
+        criterion = nn.MSELoss()
+    elif args.loss_type == 'mae':
+        criterion = nn.L1Loss()
+    elif args.loss_type == 'huber':
+        criterion = nn.SmoothL1Loss()
+    elif args.loss_type == 'range':
+        criterion = RegressionLossWithRangeAwareness(variance_weight=0.1, range_weight=0.05)
+    else:
+        criterion = nn.MSELoss()
+    print(f"Using loss type: {args.loss_type}")
+
+    # scheduler: either warmup+cosine or reduce-on-plateau
+    if args.use_plateau_scheduler:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5,
+                                                               patience=5, verbose=True)
+        print("Using ReduceLROnPlateau scheduler")
+    else:
+        scheduler = create_warmup_scheduler(optimizer, warmup_epochs=args.warmup_epochs, 
+                                           total_epochs=args.epochs)
 
     # Training loop
     train_losses = []
@@ -307,11 +363,29 @@ def main():
     print("STARTING TRAINING WITH TRANSFER LEARNING")
     print("="*70 + "\n")
 
+    no_improve_epochs = 0
     for epoch in range(start_epoch, args.epochs):
         net.train()
         running_loss = 0.0
         pbar = tqdm(train_loader, file=sys.stdout, desc=f"Epoch {epoch+1}/{args.epochs}")
         
+        # unfreeze backbone if needed
+        if epoch == args.freeze_backbone_epochs and args.freeze_backbone_epochs > 0:
+            for name, param in net.named_parameters():
+                if 'head' not in name:
+                    param.requires_grad = True
+            optimizer = create_optimizer_with_lr_decay(net, base_lr=args.lr, 
+                                                      weight_decay=args.weight_decay,
+                                                      backbone_lr_factor=args.backbone_lr_factor)
+            # also rebuild scheduler to use the new optimizer
+            if args.use_plateau_scheduler:
+                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5,
+                                                                       patience=5, verbose=True)
+            else:
+                scheduler = create_warmup_scheduler(optimizer, warmup_epochs=args.warmup_epochs, 
+                                                   total_epochs=args.epochs)
+            print("Backbone unfrozen, optimizer and scheduler recreated")
+
         for images, hb_vals in pbar:
             images = images.to(device)
             hb_vals = hb_vals.view(-1, 1).to(device)
@@ -355,21 +429,42 @@ def main():
         val_mae = mae(all_trues, all_preds)
         val_rmse = rmse(all_trues, all_preds)
         val_mape = mape(all_trues, all_preds)
+        # r2 score
+        tot_var = np.sum((all_trues - np.mean(all_trues))**2)
+        res_var = np.sum((all_trues - all_preds)**2)
+        val_r2 = 1.0 - (res_var / tot_var) if tot_var > 0 else float('nan')
         val_mae_list.append(val_mae)
         val_rmse_list.append(val_rmse)
         val_mape_list.append(val_mape)
+        # store R2 separately if desired
+        print(f"Validation | MAE: {val_mae:.4f}, RMSE: {val_rmse:.4f}, MAPE: {val_mape:.2f}%, R2: {val_r2:.4f}")
 
-        print(f"Validation | MAE: {val_mae:.4f}, RMSE: {val_rmse:.4f}, MAPE: {val_mape:.2f}%")
         print(f"Pred Range: [{all_preds.min():.2f}, {all_preds.max():.2f}] | "
               f"True Range: [{all_trues.min():.2f}, {all_trues.max():.2f}]")
 
         # Step scheduler
-        scheduler.step()
+        if args.use_plateau_scheduler:
+            scheduler.step(val_mae)
+        else:
+            scheduler.step()
+
+        # early stopping counter
+        if args.early_stopping_patience > 0:
+            if val_mae < best_val_mae - 1e-6:
+                best_val_mae = val_mae
+                no_improve_epochs = 0
+            else:
+                no_improve_epochs += 1
+            if no_improve_epochs >= args.early_stopping_patience:
+                print(f"Early stopping triggered after {no_improve_epochs} epochs without improvement.")
+                break
+        else:
+            if val_mae < best_val_mae:
+                best_val_mae = val_mae
 
         # Save best model
         os.makedirs(args.save_dir, exist_ok=True)
-        if val_mae < best_val_mae:
-            best_val_mae = val_mae
+        if val_mae <= best_val_mae + 1e-6:
             torch.save({
                 'epoch': epoch,
                 'model_state': net.state_dict(),
@@ -411,6 +506,11 @@ def main():
     print(f"MAE: {mae(trues, preds):.4f}")
     print(f"RMSE: {rmse(trues, preds):.4f}")
     print(f"MAPE: {mape(trues, preds):.2f}%")
+    # compute final R2
+    tot_var = np.sum((trues - np.mean(trues))**2)
+    res_var = np.sum((trues - preds)**2)
+    r2_final = 1.0 - (res_var / tot_var) if tot_var > 0 else float('nan')
+    print(f"R2: {r2_final:.4f}")
     print("="*70 + "\n")
 
     # Save plots
