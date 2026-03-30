@@ -141,6 +141,24 @@ def evaluate_and_plot(model, val_loader, model_path, device, exp_name='dsamamba'
     all_labels = np.array(all_labels)
     all_probs = np.array(all_probs)
     
+    # Diagnostic: Check if model is predicting only one class
+    unique_preds = np.unique(all_preds)
+    if len(unique_preds) == 1:
+        print("\n" + "⚠️ "*25)
+        print("WARNING: MODEL IS PREDICTING ONLY ONE CLASS!")
+        print(f"All {len(all_preds)} predictions are class {unique_preds[0]}")
+        print(f"Actual labels distribution: {np.bincount(all_labels.astype(int))}")
+        print("\nThis usually means:")
+        print("  1. CLASS IMBALANCE - Too many samples of one class")
+        print("  2. POOR LEARNING - Learning rate too low or model not training")
+        print("  3. DATA QUALITY - Check if labels are correct")
+        print("\nRecommended fixes:")
+        print("  • Check class distribution with check_distribution.py")
+        print("  • Try increasing learning rate (0.0001 → 0.001)")
+        print("  • Add class weights to CrossEntropyLoss")
+        print("  • Validate data annotation quality")
+        print("⚠️ "*25 + "\n")
+    
     # Calculate metrics
     accuracy = np.mean(all_preds == all_labels)
     precision = precision_score(all_labels, all_preds, average='macro', zero_division=0)
@@ -149,17 +167,33 @@ def evaluate_and_plot(model, val_loader, model_path, device, exp_name='dsamamba'
     
     # Binary classification specific metrics
     if len(np.unique(all_labels)) == 2:
-        auc_score = roc_auc_score(all_labels, all_probs[:, 1])
-        fpr, tpr, _ = roc_curve(all_labels, all_probs[:, 1])
-        roc_auc = auc(fpr, tpr)
-        
-        # Specificity (True Negative Rate)
-        cm = confusion_matrix(all_labels, all_preds)
-        tn, fp, fn, tp = cm.ravel()
-        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+        try:
+            auc_score = roc_auc_score(all_labels, all_probs[:, 1])
+            fpr, tpr, _ = roc_curve(all_labels, all_probs[:, 1])
+            roc_auc = auc(fpr, tpr)
+        except Exception as e:
+            print(f"Warning: Could not calculate AUC: {e}")
+            auc_score = 0.0
+            
+        # Specificity (True Negative Rate) - force 2x2 matrix with labels=[0, 1]
+        try:
+            cm = confusion_matrix(all_labels, all_preds, labels=[0, 1])
+            if cm.shape == (2, 2):
+                tn, fp, fn, tp = cm.ravel()
+                specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+            else:
+                specificity = 0.0
+        except Exception as e:
+            print(f"Warning: Could not calculate confusion matrix: {e}")
+            specificity = 0.0
+            
         sensitivity = recall  # For binary, recall = sensitivity
     else:
-        auc_score = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='macro')
+        try:
+            auc_score = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='macro')
+        except Exception as e:
+            print(f"Warning: Could not calculate multiclass AUC: {e}")
+            auc_score = 0.0
         specificity = None
         sensitivity = recall
     
@@ -178,11 +212,25 @@ def evaluate_and_plot(model, val_loader, model_path, device, exp_name='dsamamba'
     print("="*50 + "\n")
     
     # Plot 1: Confusion Matrix
-    cm = confusion_matrix(all_labels, all_preds)
+    try:
+        # Try to make 2x2 matrix for binary classification
+        if len(np.unique(all_labels)) == 2:
+            cm = confusion_matrix(all_labels, all_preds, labels=[0, 1])
+        else:
+            cm = confusion_matrix(all_labels, all_preds)
+    except Exception as e:
+        print(f"Warning: Could not compute confusion matrix: {e}")
+        cm = np.array([[1, 0], [0, 1]])  # Dummy matrix
+    
     plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=True,
-                xticklabels=['Non-Anemic', 'Anemic'] if len(np.unique(all_labels)) == 2 else None,
-                yticklabels=['Non-Anemic', 'Anemic'] if len(np.unique(all_labels)) == 2 else None)
+    
+    # Build heatmap with appropriate labels
+    heatmap_kwargs = {'annot': True, 'fmt': 'd', 'cmap': 'Blues', 'cbar': True}
+    if len(np.unique(all_labels)) == 2:
+        heatmap_kwargs['xticklabels'] = ['Non-Anemic', 'Anemic']
+        heatmap_kwargs['yticklabels'] = ['Non-Anemic', 'Anemic']
+    
+    sns.heatmap(cm, **heatmap_kwargs)
     plt.ylabel('True Label', fontsize=12, fontweight='bold')
     plt.xlabel('Predicted Label', fontsize=12, fontweight='bold')
     plt.title('Confusion Matrix - Validation Set', fontsize=14, fontweight='bold')
@@ -194,24 +242,28 @@ def evaluate_and_plot(model, val_loader, model_path, device, exp_name='dsamamba'
     
     # Plot 2: ROC Curve (for binary classification)
     if len(np.unique(all_labels)) == 2:
-        fpr, tpr, _ = roc_curve(all_labels, all_probs[:, 1])
-        roc_auc = auc(fpr, tpr)
-        
-        plt.figure(figsize=(8, 6))
-        plt.plot(fpr, tpr, color='#FF6B6B', lw=2, label=f'ROC curve (AUC = {roc_auc:.4f})')
-        plt.plot([0, 1], [0, 1], color='gray', lw=2, linestyle='--', label='Random Classifier')
-        plt.xlim([0.0, 1.0])
-        plt.ylim([0.0, 1.05])
-        plt.xlabel('False Positive Rate', fontsize=12, fontweight='bold')
-        plt.ylabel('True Positive Rate', fontsize=12, fontweight='bold')
-        plt.title('ROC Curve - Validation Set', fontsize=14, fontweight='bold')
-        plt.legend(loc="lower right", fontsize=11)
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        roc_path = os.path.join(output_dir, f"{exp_name}_roc_curve.png")
-        plt.savefig(roc_path, dpi=300, bbox_inches='tight')
-        print(f"✓ Saved: {roc_path}")
-        plt.close()
+        try:
+            fpr, tpr, _ = roc_curve(all_labels, all_probs[:, 1])
+            roc_auc = auc(fpr, tpr)
+            
+            plt.figure(figsize=(8, 6))
+            plt.plot(fpr, tpr, color='#FF6B6B', lw=2, label=f'ROC curve (AUC = {roc_auc:.4f})')
+            plt.plot([0, 1], [0, 1], color='gray', lw=2, linestyle='--', label='Random Classifier')
+            plt.xlim([0.0, 1.0])
+            plt.ylim([0.0, 1.05])
+            plt.xlabel('False Positive Rate', fontsize=12, fontweight='bold')
+            plt.ylabel('True Positive Rate', fontsize=12, fontweight='bold')
+            plt.title('ROC Curve - Validation Set', fontsize=14, fontweight='bold')
+            plt.legend(loc="lower right", fontsize=11)
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            roc_path = os.path.join(output_dir, f"{exp_name}_roc_curve.png")
+            plt.savefig(roc_path, dpi=300, bbox_inches='tight')
+            print(f"✓ Saved: {roc_path}")
+            plt.close()
+        except Exception as e:
+            print(f"Warning: Could not create ROC curve: {e}")
+            print("  (This may happen if model predicts only one class)")
     
     # Plot 3: Class Distribution
     unique, counts = np.unique(all_labels, return_counts=True)
